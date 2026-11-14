@@ -1,0 +1,501 @@
+import math
+from collections import deque
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ==============================================================================
+# 1. MAZE ENVIRONMENTS (15-STATE 3x5 AND 20-STATE 4x5)
+# ==============================================================================
+def build_maze(num_states, edges, goal):
+    F = np.zeros((num_states, num_states), dtype=int)
+    for u, v in edges:
+        F[u, v] = 1
+        F[v, u] = 1
+    F[goal, goal] = 1
+    legal = [np.flatnonzero(F[s]) for s in range(num_states)]
+    return F, legal
+
+
+# 3x5 Maze (15 states: start=0, goal=14, BFS shortest path = 10 steps)
+EDGES_15 = [
+    (0, 5), (5, 10), (10, 11), (11, 6), (6, 1), (1, 2),
+    (2, 3), (3, 4), (2, 7), (7, 8), (8, 9), (7, 12),
+    (12, 13), (13, 14)
+]
+
+# 4x5 Maze (20 states: start=0, goal=19, BFS shortest path = 15 steps, dead ends)
+EDGES_20 = [
+    (0, 1), (1, 6), (6, 5), (5, 10), (10, 15),
+    (10, 11), (11, 16), (16, 17), (17, 12), (12, 7),
+    (7, 2), (2, 3), (7, 8), (8, 3), (8, 9), (9, 4),
+    (9, 14), (14, 13), (13, 18), (14, 19)
+]
+
+
+# ==============================================================================
+# 2. EXACT BASELINES: BFS (SYMBOLIC), VALUE ITERATION (DP), MARKOV RANDOM WALK
+# ==============================================================================
+def bfs_shortest_path(legal, start, goal):
+    queue = deque([(start, 0)])
+    visited = {start}
+    while queue:
+        curr, dist = queue.popleft()
+        if curr == goal:
+            return dist
+        for nxt in legal[curr]:
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append((nxt, dist + 1))
+    return -1
+
+
+def value_iteration(legal, goal, gamma=0.80, step_cost=-0.10, goal_reward=10.0, slip_prob=0.0, tol=1e-9):
+    n = len(legal)
+    V = np.zeros(n)
+    sweeps = 0
+    while True:
+        delta = 0.0
+        V_new = np.zeros(n)
+        for s in range(n):
+            if s == goal:
+                continue
+            acts = legal[s]
+            best_val = -1e9
+            for a in acts:
+                val = 0.0
+                for s_next in acts:
+                    prob = (1.0 - slip_prob) + (slip_prob / len(acts)) if s_next == a else (slip_prob / len(acts))
+                    r = goal_reward if s_next == goal else step_cost
+                    val += prob * (r + gamma * V[s_next])
+                if val > best_val:
+                    best_val = val
+            V_new[s] = best_val
+            delta = max(delta, abs(V_new[s] - V[s]))
+        V = V_new
+        sweeps += 1
+        if delta < tol:
+            break
+
+    policy = np.zeros(n, dtype=int)
+    for s in range(n):
+        if s == goal:
+            policy[s] = goal
+            continue
+        acts = legal[s]
+        q_vals = []
+        for a in acts:
+            val = 0.0
+            for s_next in acts:
+                prob = (1.0 - slip_prob) + (slip_prob / len(acts)) if s_next == a else (slip_prob / len(acts))
+                r = goal_reward if s_next == goal else step_cost
+                val += prob * (r + gamma * V[s_next])
+            q_vals.append(val)
+        policy[s] = acts[int(np.argmax(q_vals))]
+    return V, policy, sweeps
+
+
+def exact_random_walk_hitting_time(legal, start, goal, step_cost=-0.10, goal_reward=10.0):
+    n = len(legal)
+    transient = [s for s in range(n) if s != goal]
+    idx_map = {s: i for i, s in enumerate(transient)}
+    P = np.zeros((len(transient), len(transient)))
+    for s in transient:
+        acts = legal[s]
+        p = 1.0 / len(acts)
+        for nxt in acts:
+            if nxt != goal:
+                P[idx_map[s], idx_map[nxt]] += p
+    N = np.linalg.inv(np.eye(len(transient)) - P)
+    t = N @ np.ones(len(transient))
+    steps = float(t[idx_map[start]])
+    expected_return = (steps - 1.0) * step_cost + goal_reward
+    return steps, expected_return
+
+
+def simulated_random_walk(legal, start, goal, runs=2000, seed=42, step_cost=-0.10, goal_reward=10.0):
+    rng = np.random.default_rng(seed)
+    steps_list, returns_list = [], []
+    for _ in range(runs):
+        s = start
+        steps, total_r = 0, 0.0
+        while s != goal and steps < 5000:
+            s = int(rng.choice(legal[s]))
+            steps += 1
+            total_r += goal_reward if s == goal else step_cost
+        steps_list.append(steps)
+        returns_list.append(total_r)
+    return float(np.mean(steps_list)), float(np.mean(returns_list))
+
+
+# ==============================================================================
+# 3. WILCOXON SIGNED-RANK TEST (EXACT FOR N<10, TIE-CORRECTED FOR N>=10)
+# ==============================================================================
+def wilcoxon_signed_rank(x, y):
+    diffs = np.asarray(x, dtype=float) - np.asarray(y, dtype=float)
+    diffs = diffs[diffs != 0.0]
+    n = len(diffs)
+    if n == 0:
+        return 1.0
+    abs_d = np.abs(diffs)
+    order = np.argsort(abs_d)
+    ranks = np.zeros(n)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and abs_d[order[j + 1]] == abs_d[order[i]]:
+            j += 1
+        avg_rank = 0.5 * (i + j) + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+
+    w_plus = float(np.sum(ranks[diffs > 0]))
+    w_minus = float(np.sum(ranks[diffs < 0]))
+    w_stat = min(w_plus, w_minus)
+
+    if n < 10:
+        count = 0
+        for mask in range(1 << n):
+            s_plus = sum(ranks[b] for b in range(n) if (mask >> b) & 1)
+            s_minus = sum(ranks) - s_plus
+            if min(s_plus, s_minus) <= w_stat + 1e-12:
+                count += 1
+        return count / (1 << n)
+
+    # Tie-corrected normal approximation
+    _, counts = np.unique(abs_d, return_counts=True)
+    tie_corr = np.sum(counts ** 3 - counts) / 48.0
+    mu = n * (n + 1) / 4.0
+    sigma = math.sqrt(max(1e-12, (n * (n + 1) * (2 * n + 1) / 24.0) - tie_corr))
+    z = (abs(w_stat - mu) - 0.5) / sigma
+    return math.erfc(max(0.0, z) / math.sqrt(2.0))
+
+
+# ==============================================================================
+# 4. TD CONTROL & DYNA-Q PLANNING ALGORITHMS
+# ==============================================================================
+def select_epsilon_greedy(Q, s, legal_s, eps, rng):
+    if rng.random() < eps:
+        return int(rng.choice(legal_s))
+    q_vals = Q[s, legal_s]
+    max_q = np.max(q_vals)
+    best = legal_s[np.flatnonzero(np.isclose(q_vals, max_q))]
+    return int(rng.choice(best))
+
+
+def greedy_rollout_steps(Q, legal, start, goal, max_steps=100):
+    s = start
+    seen = {s}
+    steps = 0
+    while s != goal and steps < max_steps:
+        acts = legal[s]
+        a = int(acts[np.argmax(Q[s, acts])])
+        s = a
+        steps += 1
+        if s in seen and s != goal:
+            return -1  # Cycle detected
+        seen.add(s)
+    return steps if s == goal else -1
+
+
+def evaluate_stochastic_policy(Q, legal, start, goal, slip_prob=0.20, eval_runs=200, seed=999,
+                               step_cost=-0.10, goal_reward=10.0):
+    rng = np.random.default_rng(seed)
+    returns, successes = [], 0
+    for _ in range(eval_runs):
+        s = start
+        steps, total_r = 0, 0.0
+        while s != goal and steps < 200:
+            acts = legal[s]
+            a = int(acts[np.argmax(Q[s, acts])])
+            if rng.random() < slip_prob:
+                s_next = int(rng.choice(acts))
+            else:
+                s_next = a
+            steps += 1
+            total_r += goal_reward if s_next == goal else step_cost
+            s = s_next
+        if s == goal:
+            successes += 1
+        returns.append(total_r)
+    return (successes / eval_runs) * 100.0, float(np.mean(returns))
+
+
+def train_agent(
+    legal, start, goal, algo="q_learning", eps_mode="decay",
+    alpha=0.20, gamma=0.80, episodes=1000, random_starts=False,
+    slip_prob=0.0, planning_steps=5, seed=0,
+    step_cost=-0.10, goal_reward=10.0
+):
+    n = len(legal)
+    rng = np.random.default_rng(seed)
+    Q = np.zeros((n, n))
+    model = {}  # (s, a) -> (r, s_next) for Dyna-Q
+    non_goal = [s for s in range(n) if s != goal]
+    opt_steps = bfs_shortest_path(legal, start, goal)
+
+    ep_steps = np.zeros(episodes)
+    ep_returns = np.zeros(episodes)
+    is_optimal_ep = np.zeros(episodes, dtype=bool)
+
+    for ep in range(episodes):
+        eps = max(0.01, 1.0 * (0.995 ** ep)) if eps_mode == "decay" else float(eps_mode)
+        s = int(rng.choice(non_goal)) if random_starts else start
+        acts = legal[s]
+        a = select_epsilon_greedy(Q, s, acts, eps, rng)
+
+        steps, total_r = 0, 0.0
+        while s != goal and steps < 1000:
+            acts_s = legal[s]
+            if slip_prob > 0.0 and rng.random() < slip_prob:
+                s_next = int(rng.choice(acts_s))
+            else:
+                s_next = a
+
+            r = goal_reward if s_next == goal else step_cost
+            steps += 1
+            total_r += r
+
+            if s_next == goal:
+                target = r
+                Q[s, a] += alpha * (target - Q[s, a])
+                if algo == "dyna_q":
+                    model[(s, a)] = (r, s_next)
+                break
+
+            acts_next = legal[s_next]
+            a_next = select_epsilon_greedy(Q, s_next, acts_next, eps, rng)
+
+            if algo in ("q_learning", "dyna_q"):
+                target = r + gamma * np.max(Q[s_next, acts_next])
+            elif algo == "sarsa":
+                target = r + gamma * Q[s_next, a_next]
+            elif algo == "expected_sarsa":
+                q_next = Q[s_next, acts_next]
+                max_q = np.max(q_next)
+                best_mask = np.isclose(q_next, max_q)
+                probs = np.full(len(acts_next), eps / len(acts_next))
+                probs[best_mask] += (1.0 - eps) / np.sum(best_mask)
+                target = r + gamma * float(np.dot(probs, q_next))
+
+            Q[s, a] += alpha * (target - Q[s, a])
+
+            # Dyna-Q simulated planning updates (Moerland et al., 2023)
+            if algo == "dyna_q":
+                model[(s, a)] = (r, s_next)
+                keys = list(model.keys())
+                for _ in range(planning_steps):
+                    ps, pa = keys[int(rng.integers(len(keys)))]
+                    pr, ps_next = model[(ps, pa)]
+                    if ps_next == goal:
+                        p_target = pr
+                    else:
+                        p_target = pr + gamma * np.max(Q[ps_next, legal[ps_next]])
+                    Q[ps, pa] += alpha * (p_target - Q[ps, pa])
+
+            s, a = s_next, a_next
+
+        ep_steps[ep] = steps
+        ep_returns[ep] = total_r
+
+        # Check test-time greedy optimality
+        if random_starts:
+            all_opt = all(
+                greedy_rollout_steps(Q, legal, st, goal) == bfs_shortest_path(legal, st, goal)
+                for st in non_goal
+            )
+            is_optimal_ep[ep] = all_opt
+        else:
+            is_optimal_ep[ep] = (greedy_rollout_steps(Q, legal, start, goal) == opt_steps)
+
+    # First episode after which greedy policy stays strictly optimal
+    conv_ep = episodes
+    for ep in range(episodes):
+        if np.all(is_optimal_ep[ep:]):
+            conv_ep = ep + 1
+            break
+
+    return {
+        "Q": Q,
+        "optimal_end": bool(is_optimal_ep[-1]),
+        "conv_ep": conv_ep,
+        "steps_early": float(np.mean(ep_steps[:100])),
+        "return_late": float(np.mean(ep_returns[-100:])),
+        "total_steps": float(np.sum(ep_steps)),
+        "ep_steps": ep_steps,
+        "ep_returns": ep_returns,
+    }
+
+
+# ==============================================================================
+# 5. RUN BENCHMARKS, WILCOXON TESTS, HYPERPARAMETER SWEEP & PLOTS
+# ==============================================================================
+def run_all_experiments():
+    mazes = [
+        ("15-State (3x5)", 15, EDGES_15, 0, 14),
+        ("20-State (4x5)", 20, EDGES_20, 0, 19),
+    ]
+    variants = [
+        ("Q-Learning", "q_learning", 0.1),
+        ("Q-Learning", "q_learning", 0.3),
+        ("Q-Learning", "q_learning", "decay"),
+        ("SARSA", "sarsa", 0.1),
+        ("SARSA", "sarsa", 0.3),
+        ("SARSA", "sarsa", "decay"),
+        ("Expected SARSA", "expected_sarsa", "decay"),
+        ("Dyna-Q (n=5)", "dyna_q", "decay"),
+    ]
+    seeds = list(range(20))
+    curves_for_plot = {}
+
+    for m_name, n_states, edges, start, goal in mazes:
+        _, legal = build_maze(n_states, edges, goal)
+        bfs_steps = bfs_shortest_path(legal, start, goal)
+        bfs_ret = (bfs_steps - 1) * (-0.10) + 10.0
+        _, _, vi_sweeps = value_iteration(legal, goal)
+        rw_sim_s, rw_sim_r = simulated_random_walk(legal, start, goal)
+        rw_ex_s, rw_ex_r = exact_random_walk_hitting_time(legal, start, goal)
+
+        print("=" * 88)
+        print(f"{m_name} | BFS Shortest Path: {bfs_steps} steps (+{bfs_ret:.2f}) | Value Iteration: {vi_sweeps} sweeps")
+        print(f"Random Walk -> Simulated: {rw_sim_s:.1f} steps ({rw_sim_r:.2f}) | Exact Markov: {rw_ex_s:.1f} steps ({rw_ex_r:.2f})")
+
+        for r_starts in [False, True]:
+            mode_label = "Random Starts" if r_starts else "Fixed Start (0)"
+            print(f"\n-- {mode_label} (20 seeds, mean +/- SD) --")
+            print(f"{'Algorithm':<16} {'Eps':<8} {'Opt%':<6} {'Conv Ep':<12} {'Steps<100':<11} {'Late Ret':<10} {'Total Steps'}")
+            seed_conv_store = {}
+            for label, algo, eps_m in variants:
+                runs = [
+                    train_agent(legal, start, goal, algo=algo, eps_mode=eps_m, random_starts=r_starts, seed=sd)
+                    for sd in seeds
+                ]
+                opt_pct = 100.0 * np.mean([r["optimal_end"] for r in runs])
+                convs = [r["conv_ep"] for r in runs]
+                s_early = np.mean([r["steps_early"] for r in runs])
+                r_late = np.mean([r["return_late"] for r in runs])
+                tot_s = np.mean([r["total_steps"] for r in runs])
+                eps_str = "decay" if eps_m == "decay" else f"{eps_m:.1f}"
+                seed_conv_store[(algo, eps_str)] = convs
+
+                if not r_starts:
+                    curves_for_plot[(m_name, algo, eps_str)] = np.mean([r["ep_steps"] for r in runs], axis=0)
+
+                print(f"{label:<16} {eps_str:<8} {opt_pct:>4.0f}%  {np.mean(convs):>4.0f} +/- {np.std(convs, ddof=1):<4.0f}"
+                      f" {s_early:>8.1f}   {r_late:>8.2f}   {tot_s:>9.0f}")
+
+            # Wilcoxon signed-rank p-values on Convergence Episode
+            p_ql_sarsa_01 = wilcoxon_signed_rank(seed_conv_store[("q_learning", "0.1")], seed_conv_store[("sarsa", "0.1")])
+            p_ql_sarsa_dec = wilcoxon_signed_rank(seed_conv_store[("q_learning", "decay")], seed_conv_store[("sarsa", "decay")])
+            p_ql_dyna_dec = wilcoxon_signed_rank(seed_conv_store[("q_learning", "decay")], seed_conv_store[("dyna_q", "decay")])
+            print(f"Wilcoxon p-values (Conv Ep): Q vs SARSA (eps=0.1) p={p_ql_sarsa_01:.4f} | "
+                  f"Q vs SARSA (decay) p={p_ql_sarsa_dec:.4f} | Q vs Dyna-Q (decay) p={p_ql_dyna_dec:.4f}")
+
+    # --------------------------------------------------------------------------
+    # EXTENSION A: STOCHASTIC SLIPPERY TRANSITIONS (20-STATE MAZE, p_slip=0.20)
+    # --------------------------------------------------------------------------
+    _, legal20 = build_maze(20, EDGES_20, 19)
+    print("\n" + "=" * 88)
+    print("EXTENSION A: Stochastic Transitions (20-State Maze, p_slip=0.20, 20 seeds)")
+    stoch_algos = [
+        ("Q-Learning (decay)", "q_learning"),
+        ("SARSA (decay)", "sarsa"),
+        ("Expected SARSA (decay)", "expected_sarsa"),
+        ("Dyna-Q n=5 (decay)", "dyna_q"),
+    ]
+    stoch_returns = {}
+    for label, algo in stoch_algos:
+        runs = [
+            train_agent(legal20, 0, 19, algo=algo, eps_mode="decay", slip_prob=0.20, seed=sd)
+            for sd in seeds
+        ]
+        evals = [evaluate_stochastic_policy(r["Q"], legal20, 0, 19, slip_prob=0.20, seed=100 + sd) for sd, r in enumerate(runs)]
+        succ = np.mean([e[0] for e in evals])
+        rets = [e[1] for e in evals]
+        stoch_returns[algo] = rets
+        print(f"{label:<24} | Goal Reach (<200 steps): {succ:5.1f}% | Mean Eval Return: {np.mean(rets):6.2f} +/- {np.std(rets, ddof=1):.2f}")
+
+    print(f"Wilcoxon p-value (Stochastic Return Q vs Expected SARSA): "
+          f"p={wilcoxon_signed_rank(stoch_returns['q_learning'], stoch_returns['expected_sarsa']):.4f}")
+
+    # --------------------------------------------------------------------------
+    # EXTENSION B: HYPERPARAMETER SENSITIVITY SWEEP (ALPHA x GAMMA, 20-STATE)
+    # --------------------------------------------------------------------------
+    print("\n" + "=" * 88)
+    print("EXTENSION B: Hyperparameter Sensitivity Sweep (Q-Learning Decay, 20-State Maze, 20 seeds)")
+    alphas = [0.10, 0.20, 0.50]
+    gammas = [0.50, 0.80, 0.95]
+    sweep_matrix = np.zeros((len(alphas), len(gammas)))
+    for i, a_val in enumerate(alphas):
+        row_str = f"alpha={a_val:.2f} | "
+        for j, g_val in enumerate(gammas):
+            runs = [
+                train_agent(legal20, 0, 19, algo="q_learning", eps_mode="decay", alpha=a_val, gamma=g_val, seed=sd)
+                for sd in seeds
+            ]
+            convs = [r["conv_ep"] for r in runs]
+            sweep_matrix[i, j] = np.mean(convs)
+            row_str += f"gamma={g_val:.2f}: {np.mean(convs):4.1f} +/- {np.std(convs, ddof=1):3.1f} ep | "
+        print(row_str)
+
+    # --------------------------------------------------------------------------
+    # GENERATE FIGURE 1: LEARNING CURVES (15-STATE & 20-STATE)
+    # --------------------------------------------------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=False)
+    for ax, (m_name, _, _, _, _), opt_b in zip(axes, mazes, [10, 15]):
+        window = 20
+        kernel = np.ones(window) / window
+        plot_specs = [
+            (("q_learning", "0.1"), "Q-Learning (Fixed $\\epsilon=0.1$)", "--", "#1f77b4"),
+            (("q_learning", "0.3"), "Q-Learning (Fixed $\\epsilon=0.3$)", ":", "#ff7f0e"),
+            (("q_learning", "decay"), "Q-Learning (Decay)", "-", "#2ca02c"),
+            (("sarsa", "decay"), "SARSA (Decay)", "-.", "#d62728"),
+            (("dyna_q", "decay"), "Dyna-Q $n=5$ (Decay)", "-", "#9467bd"),
+        ]
+        for key, lbl, ls, col in plot_specs:
+            smooth = np.convolve(curves_for_plot[(m_name, key[0], key[1])], kernel, mode="valid")
+            ax.plot(np.arange(window, 1001), smooth, label=lbl, linestyle=ls, color=col, linewidth=1.6)
+        ax.axhline(opt_b, color="black", linestyle=":", linewidth=1.2, label=f"BFS Optimal ({opt_b} steps)")
+        ax.set_yscale("log")
+        ax.set_title(f"{m_name} Maze (20-Seed Mean)", fontsize=10, fontweight="bold")
+        ax.set_xlabel("Training Episode")
+        ax.set_ylabel("Steps to Goal (20-Ep Moving Avg, Log Scale)")
+        ax.grid(True, which="both", alpha=0.25)
+    axes[1].legend(fontsize=7.5, loc="upper right")
+    plt.tight_layout()
+    plt.savefig("fig1_learning_curves.png", dpi=300)
+    plt.close()
+
+    # --------------------------------------------------------------------------
+    # GENERATE FIGURE 2: HYPERPARAMETER HEATMAP & STOCHASTIC RETURN COMPARISON
+    # --------------------------------------------------------------------------
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 4.0))
+    im = ax1.imshow(sweep_matrix, cmap="YlGnBu_r", aspect="auto")
+    ax1.set_xticks(range(len(gammas)))
+    ax1.set_xticklabels([f"$\\gamma={g}$" for g in gammas])
+    ax1.set_yticks(range(len(alphas)))
+    ax1.set_yticklabels([f"$\\alpha={a}$" for a in alphas])
+    ax1.set_title("20-State Convergence Ep. ($\\alpha \\times \\gamma$ Sweep)", fontsize=10, fontweight="bold")
+    for i in range(len(alphas)):
+        for j in range(len(gammas)):
+            ax1.text(j, i, f"{sweep_matrix[i, j]:.1f}", ha="center", va="center", color="black", fontweight="bold")
+    plt.colorbar(im, ax=ax1, label="Mean Convergence Episode")
+
+    labels_s = ["Q-Learning", "SARSA", "Exp. SARSA", "Dyna-Q"]
+    means_s = [np.mean(stoch_returns[k]) for _, k in stoch_algos]
+    sds_s = [np.std(stoch_returns[k], ddof=1) for _, k in stoch_algos]
+    bars = ax2.bar(labels_s, means_s, yerr=sds_s, capsize=4, color=["#2ca02c", "#d62728", "#17becf", "#9467bd"], alpha=0.85)
+    ax2.set_title("Stochastic Slip ($p=0.20$) Eval Return", fontsize=10, fontweight="bold")
+    ax2.set_ylabel("Mean Cumulative Return (20 Seeds)")
+    ax2.grid(axis="y", alpha=0.3)
+    for bar, m_val in zip(bars, means_s):
+        ax2.text(bar.get_x() + bar.get_width() / 2, m_val + 0.15, f"{m_val:.2f}", ha="center", fontsize=8.5)
+    plt.tight_layout()
+    plt.savefig("fig2_extensions.png", dpi=300)
+    plt.close()
+    print("\nSaved fig1_learning_curves.png and fig2_extensions.png successfully.")
+
+
+if __name__ == "__main__":
+    run_all_experiments()
